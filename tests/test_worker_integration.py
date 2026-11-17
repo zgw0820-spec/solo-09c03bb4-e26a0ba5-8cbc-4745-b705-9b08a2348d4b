@@ -19,8 +19,10 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -177,6 +179,90 @@ def uninterrupted(tmp_path_factory):
         finally:
             stop_worker(worker)
     return final
+
+
+class NotificationReceiver:
+    """Real HTTP server standing in for the operations receiver."""
+
+    def __init__(self, status: int = 201) -> None:
+        self.status = status
+        self.bodies: list[bytes] = []
+        self.event_ids: list[str | None] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                outer.bodies.append(body)
+                outer.event_ids.append(self.headers.get("X-Event-Id"))
+                self.send_response(outer.status)
+                self.end_headers()
+                self.wfile.write(b'{"accepted":true}')
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        host, port = self.server.server_address
+        return f"http://{host}:{port}/notify"
+
+    def __enter__(self) -> "NotificationReceiver":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def test_two_workers_deliver_completion_message_exactly_once(tmp_path):
+    """Both workers have a notifier; only one may send the completed job."""
+    db = tmp_path / "notify.db"
+    with NotificationReceiver() as receiver_server:
+        with Server(db, free_port()) as server:
+            payload = {**dataset(records=24, seed=13),
+                       "notification_url": receiver_server.url}
+            job = server.post("/jobs", payload)
+            workers = [
+                start_worker(db, f"worker-{index}",
+                             TRAINING_NOTIFY_POLL_INTERVAL="0.05")
+                for index in (1, 2)
+            ]
+            try:
+                final = wait_completed(server, job["job_id"])
+                delivered = wait_for(
+                    lambda: (items := server.get(f"/jobs/{job['job_id']}/notifications"))
+                    and items[0]["status"] == "delivered"
+                    and items[0],
+                    timeout=30,
+                    message="notification delivery",
+                )
+                # Give the other worker's notifier a chance to (wrongly) resend.
+                time.sleep(0.5)
+                notifications = server.get(f"/jobs/{job['job_id']}/notifications")
+                latest = server.get(f"/jobs/{job['job_id']}")
+            finally:
+                for worker in workers:
+                    stop_worker(worker)
+
+        assert len(receiver_server.bodies) == 1
+        message = json.loads(receiver_server.bodies[0])
+        assert message["event_id"] == delivered["event_id"]
+        assert receiver_server.event_ids == [delivered["event_id"]]
+        assert message["final_weights"] == final["final_weights"]
+        assert message["loss"] == final["loss"]
+        assert message["job_id"] == job["job_id"]
+        assert notifications[0]["status"] == "delivered"
+        assert notifications[0]["attempts"] == 1
+        assert len(notifications) == 1
+        assert latest["notification"]["status"] == "delivered"
+        assert latest["notification"]["payload"] == message
+        assert latest["final_weights"] == final["final_weights"]
 
 
 def test_crash_and_takeover_matches_uninterrupted(tmp_path, uninterrupted):

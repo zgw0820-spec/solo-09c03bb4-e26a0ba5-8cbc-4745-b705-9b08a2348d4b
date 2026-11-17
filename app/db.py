@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     velocity_json   TEXT NOT NULL,
     loss            REAL NOT NULL,
     completed_steps INTEGER NOT NULL DEFAULT 0,
+    notification_url TEXT,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     finished_at     REAL
@@ -81,7 +82,42 @@ CREATE TABLE IF NOT EXISTS lease_epochs (
     epoch  INTEGER NOT NULL
 );
 
+-- Transactional outbox for the "job completed" notification.  A row is
+-- inserted in the same transaction that commits the final weights and the
+-- completed status.  Retries resend ``payload_json`` verbatim under the same
+-- ``event_id``, so the receiver can de-duplicate by event id.
+CREATE TABLE IF NOT EXISTS outbox (
+    event_id           TEXT PRIMARY KEY,
+    job_id             TEXT NOT NULL,
+    url                TEXT NOT NULL,
+    payload_json       TEXT NOT NULL,
+    status             TEXT NOT NULL,          -- pending | delivered
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT,
+    next_attempt_at    REAL NOT NULL,
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL,
+    sent_at            REAL,
+    delivered_status   INTEGER,
+    delivered_by       TEXT,
+    claimed_by         TEXT,
+    claim_expires_at   REAL,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, id);
+CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_outbox_job ON outbox(job_id);
+
+-- Inbox of the built-in demo receiver.  ``event_id`` is the primary key, so a
+-- retried delivery of the same event is counted, not stored twice.
+CREATE TABLE IF NOT EXISTS demo_inbox (
+    event_id          TEXT PRIMARY KEY,
+    payload_json      TEXT NOT NULL,
+    first_received_at REAL NOT NULL,
+    last_received_at  REAL NOT NULL,
+    receive_count     INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -131,15 +167,33 @@ def reader(path: Path | str) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Add a column to a database created by an older release."""
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    except sqlite3.OperationalError as exc:
+        # Another container may have raced us between the check and the ALTER.
+        if "duplicate column" not in str(exc).lower():
+            raise
+
+
 def init_db(path: Path | str) -> None:
     """Create the schema if missing.
 
     ``executescript`` commits implicitly, so it must not run inside our
     hand-managed transaction; concurrent starts serialise on SQLite's schema
     lock and every statement is idempotent.
+
+    Columns added after the first release are applied with guarded
+    ``ALTER TABLE`` statements, so an existing ``/data`` volume keeps working.
     """
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _ensure_column(conn, "jobs", "notification_url", "TEXT")
+        _ensure_column(conn, "outbox", "delivered_by", "TEXT")
     finally:
         conn.close()

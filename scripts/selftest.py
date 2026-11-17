@@ -18,8 +18,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +47,18 @@ def check_compose() -> bool:
         assert services[name]["command"][-1] == name, services[name]["command"]
     assert services["api"]["volumes"] == ["training-data:/data"]
     assert "training-data" in config["volumes"]
-    print(f"  PASS: compose has api + {workers} sharing volume training-data")
+    # Both workers must have the notification delivery settings; the demo
+    # receiver lives on the API, so the published port serves Swagger too.
+    for name in workers:
+        env = services[name]["environment"]
+        assert env["TRAINING_NOTIFY_RETRY_MIN"] == "1", (name, env)
+        assert env["TRAINING_NOTIFY_POLL_INTERVAL"] == "0.5", (name, env)
+    app_source = (ROOT / "app" / "main.py").read_text()
+    assert "/demo/receiver" in app_source
+    print(
+        f"  PASS: compose has api + {workers} sharing volume training-data;"
+        " workers carry notification settings; demo receiver on the API"
+    )
     return True
 
 
@@ -76,14 +89,14 @@ def get(port: int, path: str):
         return json.loads(response.read())
 
 
-def post(port: int, path: str, body: dict):
+def post(port: int, path: str, body: dict, timeout: float = 10):
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read())
 
 
@@ -271,6 +284,122 @@ def check_late_worker(tmp: Path) -> bool:
     return True
 
 
+def check_notification(tmp: Path) -> bool:
+    """Receiver down at completion -> message survives -> restart delivers it.
+
+    Also proves the retried body is byte-identical and the event id is stable,
+    and that the training result is untouched while delivery is failing.
+    """
+    class Capture:
+        def __init__(self) -> None:
+            self.bodies: list[bytes] = []
+            self.event_ids: list[str | None] = []
+
+        def start(self) -> None:
+            outer = self
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_POST(self):  # noqa: N802
+                    body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    outer.bodies.append(body)
+                    outer.event_ids.append(self.headers.get("X-Event-Id"))
+                    self.send_response(201)
+                    self.end_headers()
+                    self.wfile.write(b'{"accepted":true}')
+
+                def log_message(self, *args):
+                    pass
+
+            self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            self.thread.start()
+
+        def stop(self) -> None:
+            self.server.shutdown()
+            self.server.server_close()
+            self.thread.join(timeout=5)
+
+        @property
+        def url(self) -> str:
+            host, port = self.server.server_address
+            return f"http://{host}:{port}/notify"
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead_port = sock.getsockname()[1]
+
+    db = tmp / "notify.db"
+    api, port = start_api(db)
+    job = post(
+        port,
+        "/jobs",
+        {**dataset(seed=11, records=16), "notification_url": f"http://127.0.0.1:{dead_port}/notify"},
+        timeout=5,
+    )
+    # No worker yet: complete the job only after the first delivery attempt is
+    # guaranteed to fail, then restart a worker and let it retry.
+    worker = start_worker(
+        db, "notifier-a", TRAINING_NOTIFY_RETRY_MIN="0.2", TRAINING_NOTIFY_RETRY_MAX="0.5"
+    )
+    try:
+        final = completed_state(port, job["job_id"])
+        pending = wait_for(
+            lambda: (items := get(port, f"/jobs/{job['job_id']}/notifications"))
+            and items[0]["status"] == "pending"
+            and items[0]["attempts"] >= 1
+            and items[0]["last_error"]
+            and items[0],
+            60,
+            "failed delivery attempt",
+        )
+    finally:
+        stop(worker, hard=True)  # no chance to send on the way out
+
+    failed_state = get(port, f"/jobs/{job['job_id']}")
+    assert failed_state["status"] == "completed"
+    assert failed_state["final_weights"] == final["final_weights"]
+    assert failed_state["loss"] == final["loss"]
+    refused_payload = pending["payload"]
+    assert pending["attempts"] >= 1 and pending["last_error"]
+
+    capture = Capture()
+    capture.start()
+    # Repoint the queued message at the receiver that is now up. The payload is
+    # unchanged; only the delivery address changes.
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE outbox SET url=?, next_attempt_at=0", (capture.url,))
+    conn.commit()
+    conn.close()
+    worker = start_worker(db, "notifier-b", TRAINING_NOTIFY_POLL_INTERVAL="0.1")
+    try:
+        delivered = wait_for(
+            lambda: (items := get(port, f"/jobs/{job['job_id']}/notifications"))
+            and items[0]["status"] == "delivered"
+            and items[0],
+            60,
+            "delivery after restart",
+        )
+    finally:
+        stop(worker)
+        capture.stop()
+        stop(api)
+
+    assert len(capture.bodies) == 1, capture.bodies
+    body = json.loads(capture.bodies[0])
+    assert body == refused_payload, (body, refused_payload)
+    assert capture.event_ids == [delivered["event_id"]]
+    assert delivered["payload"] == refused_payload
+    assert delivered["delivered_status"] == 201
+    print(
+        f"  PASS: receiver down at completion (attempts {pending['attempts']}),"
+        f" restarted worker delivered identical event {delivered['event_id']}"
+        f" after {delivered['attempts']} attempt(s)"
+    )
+    return True
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as raw:
@@ -279,6 +408,7 @@ def main() -> int:
             ("compose", check_compose),
             ("killed-worker equivalence", lambda: check_equivalence(tmp)),
             ("late-worker fencing", lambda: check_late_worker(tmp)),
+            ("completion notification retry", lambda: check_notification(tmp)),
         ):
             print(f"[{name}]")
             try:

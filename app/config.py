@@ -28,6 +28,11 @@ class Settings:
     heartbeat_interval: float
     poll_interval: float
     batch_delay_seconds: float
+    notification_poll_interval: float = 0.5
+    notification_timeout: float = 5.0
+    notification_retry_min: float = 1.0
+    notification_retry_max: float = 30.0
+    notification_claim_seconds: float = 15.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -39,6 +44,11 @@ class Settings:
             heartbeat_interval=_float("TRAINING_HEARTBEAT_INTERVAL", 1.0),
             poll_interval=_float("TRAINING_POLL_INTERVAL", 0.3),
             batch_delay_seconds=_float("TRAINING_BATCH_DELAY_SECONDS", 0.0),
+            notification_poll_interval=_float("TRAINING_NOTIFY_POLL_INTERVAL", 0.5),
+            notification_timeout=_float("TRAINING_NOTIFY_TIMEOUT", 5.0),
+            notification_retry_min=_float("TRAINING_NOTIFY_RETRY_MIN", 1.0),
+            notification_retry_max=_float("TRAINING_NOTIFY_RETRY_MAX", 30.0),
+            notification_claim_seconds=_float("TRAINING_NOTIFY_CLAIM_SECONDS", 15.0),
         )
 
     def validate(self) -> None:
@@ -50,3 +60,11 @@ class Settings:
             raise ValueError("TRAINING_POLL_INTERVAL must be positive")
         if self.batch_delay_seconds < 0:
             raise ValueError("TRAINING_BATCH_DELAY_SECONDS must not be negative")
+        if self.notification_poll_interval <= 0:
+            raise ValueError("TRAINING_NOTIFY_POLL_INTERVAL must be positive")
+        if self.notification_timeout <= 0:
+            raise ValueError("TRAINING_NOTIFY_TIMEOUT must be positive")
+        if not (0 < self.notification_retry_min <= self.notification_retry_max):
+            raise ValueError("notification retry bounds must be positive and ordered")
+        if self.notification_claim_seconds <= 0:
+            raise ValueError("TRAINING_NOTIFY_CLAIM_SECONDS must be positive")

@@ -29,6 +29,7 @@ from . import store
 from .config import Settings
 from .db import init_db
 from .lease import Lease, LeaseLost
+from .notifier import Notifier
 
 
 class Worker:
@@ -37,6 +38,7 @@ class Worker:
         self.worker_id = worker_id
         self.stop_event = threading.Event()
         self.lease: Lease | None = None
+        self.notifier = Notifier(settings, worker_id, self.stop_event)
         self._last_heartbeat = 0.0
         self._last_status = ""
 
@@ -67,6 +69,10 @@ class Worker:
         init_db(self.settings.db_path)
         lease_mod.register_worker(self.settings.db_path, self.worker_id)
         self.beat("idle")
+        # Delivery runs beside training, not after it: a completed job's message
+        # is retried even while this worker trains the next job, and a message
+        # left pending by a dead worker is picked up by any live one.
+        self.notifier.start()
         print(f"[{self.worker_id}] started", flush=True)
         try:
             while not self.stop_event.is_set():
@@ -81,6 +87,8 @@ class Worker:
                         lease_mod.release(self.settings.db_path, self.lease)
                         self.lease = None
         finally:
+            self.stop_event.set()
+            self.notifier.join()
             if self.lease is not None:
                 lease_mod.release(self.settings.db_path, self.lease)
             lease_mod.heartbeat(self.settings.db_path, self.worker_id, "stopped")

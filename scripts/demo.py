@@ -31,6 +31,18 @@ ROOT = Path(__file__).resolve().parents[1]
 BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
 
 
+def notify_url(local: bool) -> str:
+    """Address the *workers* use for the demo receiver.
+
+    In Compose the workers reach the API by service name; for local processes
+    the API is on the loopback address. ``NOTIFY_URL`` overrides both.
+    """
+    override = os.environ.get("NOTIFY_URL")
+    if override:
+        return override
+    return "http://127.0.0.1:8000/demo/receiver" if local else "http://api:8000/demo/receiver"
+
+
 def call(method: str, path: str, body: dict | None = None):
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(
@@ -77,7 +89,7 @@ def _state_if_completed(job_id: str) -> dict | None:
     return state if state["status"] == "completed" else None
 
 
-def sample_records(count: int = 40, seed: int = 3) -> dict:
+def sample_records(count: int = 40, seed: int = 3, notification_url: str | None = None) -> dict:
     """Synthetic fan vibration/current records with shutdown labels."""
     rng = random.Random(seed)
     features, labels = [], []
@@ -97,7 +109,10 @@ def sample_records(count: int = 40, seed: int = 3) -> dict:
             ]
         )
         labels.append(label)
-    return {"features": features, "labels": labels, "epochs": 3}
+    payload = {"features": features, "labels": labels, "epochs": 3}
+    if notification_url:
+        payload["notification_url"] = notification_url
+    return payload
 
 
 def show(job: dict) -> None:
@@ -125,9 +140,11 @@ def kill_worker(mode: str, worker_id: str) -> None:
         print(f"killed local {worker_id} (pid {pid})")
 
 
-def step_1_submit() -> dict:
+def step_1_submit(url: str | None) -> dict:
     print("\n[1] submitting 40 records, 3 epochs (8 per batch -> 5 batches/epoch, 15 steps)")
-    job = call("POST", "/jobs", sample_records())
+    if url:
+        print(f"    notification_url={url}")
+    job = call("POST", "/jobs", sample_records(notification_url=url))
     print(f"    job_id={job['job_id']}")
     show(job)
     return job
@@ -213,10 +230,10 @@ def step_5_final(job_id: str) -> dict:
     return final
 
 
-def step_6_reference(interrupted: dict) -> None:
+def step_6_reference(interrupted: dict, url: str | None) -> None:
     """Train the same input again with no interruption and compare exactly."""
     print("\n[6] equivalence check: same input, no interruption")
-    job = call("POST", "/jobs", sample_records())
+    job = call("POST", "/jobs", sample_records(notification_url=url))
     reference = wait_for(
         lambda: _state_if_completed(job["job_id"]),
         timeout=180,
@@ -294,10 +311,50 @@ def local_down() -> None:
     (ROOT / ".demo-worker-a.pid").unlink(missing_ok=True)
 
 
+def step_7_notification(job_id: str) -> dict:
+    """Show that the completion message reached the demo receiver exactly."""
+    print("\n[7] completion notification")
+    notification = wait_for(
+        lambda: (
+            items := call("GET", f"/jobs/{job_id}/notifications")
+        )
+        and items[0]["status"] == "delivered"
+        and items[0],
+        timeout=120,
+        message="notification delivery",
+    )
+    payload = notification["payload"]
+    print(f"    event_id = {notification['event_id']}")
+    print(f"    status   = {notification['status']} (attempts {notification['attempts']})")
+    print(f"    payload  = job_id={payload['job_id']} loss={payload['loss']:.12f}")
+    print(f"               final_weights={payload['final_weights']}")
+
+    inbox = wait_for(
+        lambda: [
+            entry
+            for entry in call("GET", "/demo/receiver/inbox")
+            if entry["event_id"] == notification["event_id"]
+        ],
+        timeout=30,
+        message="demo receiver inbox entry",
+    )
+    entry = inbox[0]
+    print(
+        f"    receiver received event {entry['event_id']} "
+        f"({entry['receive_count']} delivery/deliveries, de-duplicated by event_id)"
+    )
+    assert entry["payload"] == payload
+    assert notification["status"] == "delivered"
+    return notification
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--local", action="store_true", help="start API and workers locally")
     parser.add_argument("--stop-after", type=int, default=4)
+    parser.add_argument(
+        "--no-notify", action="store_true", help="submit without a notification_url"
+    )
     args = parser.parse_args()
 
     if args.local:
@@ -307,13 +364,16 @@ def main() -> int:
         wait_for(_healthy, timeout=30, message="API (is docker compose up?)")
         mode = "docker"
 
+    url = None if args.no_notify else notify_url(args.local)
     try:
-        job = step_1_submit()
+        job = step_1_submit(url)
         step_2_watch(job["job_id"], args.stop_after)
         step_3_kill(mode, job["job_id"])
         step_4_failover(job["job_id"])
         final = step_5_final(job["job_id"])
-        step_6_reference(final)
+        step_6_reference(final, url)
+        if url:
+            step_7_notification(job["job_id"])
     finally:
         if args.local:
             local_down()

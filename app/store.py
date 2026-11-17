@@ -35,6 +35,7 @@ from .features import (
 )
 from .lease import Lease, LeaseLost, owner_ok
 from .model import dataset_loss, sgd_step
+from . import outbox
 
 JOB_STATUSES = ("queued", "running", "completed")
 
@@ -71,10 +72,15 @@ def create_job(
     features: list[list[float]],
     labels: list[int],
     epochs: int,
+    notification_url: str | None = None,
 ) -> dict[str, Any]:
     """Validate, normalise and enqueue a training job."""
     if not (MIN_EPOCHS <= epochs <= MAX_EPOCHS):
         raise InputError(f"epochs must be between {MIN_EPOCHS} and {MAX_EPOCHS}")
+    try:
+        notification_url = outbox.validate_url(notification_url)
+    except outbox.InvalidNotificationURL as exc:
+        raise InputError(str(exc)) from exc
     design, targets = normalise(features, labels)
     feature_dim = int(design.shape[1])
     per_epoch = math.ceil(design.shape[0] / BATCH_SIZE)
@@ -91,8 +97,9 @@ def create_job(
             INSERT INTO jobs(
                 job_id, status, feature_dim, epochs, batch_size, record_count,
                 total_batches, learning_rate, momentum, features_json, labels_json,
-                weights_json, velocity_json, loss, completed_steps, created_at, updated_at
-            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                weights_json, velocity_json, loss, completed_steps,
+                notification_url, created_at, updated_at
+            ) VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
             """,
             (
                 job_id,
@@ -108,6 +115,7 @@ def create_job(
                 _dumps(weights),
                 _dumps(velocity),
                 initial_loss,
+                notification_url,
                 now,
                 now,
             ),
@@ -121,6 +129,7 @@ def create_job(
                 "epochs": epochs,
                 "batches_per_epoch": per_epoch,
                 "total_steps": total_steps,
+                "notification_url": notification_url,
             },
         )
     job = get_job(db_path, job_id)
@@ -153,6 +162,7 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         design = np.asarray(json.loads(row["features_json"]), dtype=np.float64)
         targets = np.asarray(json.loads(row["labels_json"]), dtype=np.float64)
         evaluation_loss = dataset_loss(_loads(row["weights_json"]), design, targets)
+        notification = outbox.notification_for_job(conn, job_id)
 
     completed = int(row["completed_steps"])
     total = int(row["total_batches"]) * int(row["epochs"])
@@ -178,6 +188,8 @@ def get_job(db_path, job_id: str) -> dict[str, Any] | None:
         "final_weights": (
             _loads(row["weights_json"]).tolist() if row["status"] == "completed" else None
         ),
+        "notification_url": row["notification_url"],
+        "notification": notification,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "finished_at": row["finished_at"],
@@ -289,6 +301,7 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
                 "job_id": lease.job_id,
                 "step": int(row["completed_steps"]),
                 "total_steps": int(row["total_batches"]) * int(row["epochs"]),
+                "loss": float(row["loss"]),
                 "worker_id": lease.worker_id,
                 "lease_epoch": lease.epoch,
             }
@@ -370,6 +383,25 @@ def advance_job(db_path, lease: Lease, batch_delay: float = 0.0) -> dict[str, An
                 "job_completed",
                 {"completed_steps": new_completed, "worker_id": lease.worker_id},
             )
+            url = row["notification_url"]
+            if url:
+                # Same transaction as the final weights and the completed
+                # status: either all three are durable or none is.
+                payload_json = outbox.build_payload(
+                    lease.job_id,
+                    new_weights.tolist(),
+                    evaluation,
+                    new_completed,
+                    total_steps,
+                    now,
+                )
+                event_id = outbox.enqueue(conn, lease.job_id, url, payload_json, now)
+                _event(
+                    conn,
+                    lease.job_id,
+                    "notification_queued",
+                    {"event_id": event_id, "url": url},
+                )
     return {
         "status": "completed" if final else "running",
         "job_id": lease.job_id,
