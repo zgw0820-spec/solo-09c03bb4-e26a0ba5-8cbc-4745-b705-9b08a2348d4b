@@ -1,0 +1,70 @@
+name: fan-training
+
+x-worker-env: &worker-env
+  TRAINING_DATA_DIR: /data
+  TRAINING_LEASE_SECONDS: "6"
+  TRAINING_HEARTBEAT_INTERVAL: "1.5"
+  TRAINING_POLL_INTERVAL: "0.3"
+  TRAINING_BATCH_DELAY_SECONDS: "0.6"
+
+services:
+  api:
+    build: .
+    image: fan-training:latest
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    ports:
+      - "8000:8000"
+    environment:
+      TRAINING_DATA_DIR: /data
+      TRAINING_LEASE_SECONDS: "6"
+      TRAINING_HEARTBEAT_INTERVAL: "1.5"
+    volumes:
+      - training-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  worker-1:
+    build: .
+    image: fan-training:latest
+    command: ["python", "-m", "app.worker", "--worker-id", "worker-1"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-1
+    volumes:
+      - training-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    # No restart policy on purpose: a killed worker stays down so the demo can
+    # show worker-2 taking over. Bring it back with `docker compose start worker-1`.
+
+  worker-2:
+    build: .
+    image: fan-training:latest
+    command: ["python", "-m", "app.worker", "--worker-id", "worker-2"]
+    environment:
+      <<: *worker-env
+      WORKER_ID: worker-2
+    volumes:
+      - training-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    # Same as worker-1: no automatic restart, so failover is observable.
+
+volumes:
+  training-data:
